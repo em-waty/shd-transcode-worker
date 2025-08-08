@@ -1,0 +1,14 @@
+{
+  "name": "shd-transcode-worker",
+  "version": "1.0.0",
+  "description": "Worker for processing video transcode jobs from Redis queue",
+  "type": "module",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1",
+    "node-fetch": "^3.3.2"
+  }
+}
