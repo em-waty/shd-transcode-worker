@@ -1,4 +1,4 @@
-# shd-transcode-worker zz
+# shd-transcode-worker
 
 A Node.js worker for **video transcoding** and **thumbnail generation** on DigitalOcean Spaces.
 
