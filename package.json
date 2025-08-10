@@ -1,14 +1,20 @@
 {
   "name": "shd-transcode-worker",
   "version": "1.0.0",
-  "description": "Worker for processing video transcode jobs from Redis queue",
+  "description": "DigitalOcean Spaces video transcoding worker with MP4, HLS, and AVIF thumbnail generation",
   "type": "module",
-  "main": "worker.js",
+  "main": "worker-hls-and-mp4.js",
   "scripts": {
-    "start": "node worker.js"
+    "start": "node worker-hls-and-mp4.js",
+    "dev": "NODE_ENV=development node worker-hls-and-mp4.js"
   },
   "dependencies": {
-    "ioredis": "^5.4.1",
+    "ioredis": "^5.3.2",
     "node-fetch": "^3.3.2"
-  }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "",
+  "license": "MIT"
 }
