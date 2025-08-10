@@ -2,6 +2,7 @@
 // Streaming + timeouts + retries + multi-rendition HLS + MP4, uploads to DigitalOcean Spaces via SigV2
 // Now with AVIF thumbnails at t=0s and t=10s ( -thumb-0.avif / -thumb-10.avif )
 
+import 'dotenv/config';
 import crypto from "crypto";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
