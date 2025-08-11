@@ -470,7 +470,7 @@ async function preflightRedis() {
   try {
     const pong = await client.ping();
     if (pong !== 'PONG') throw new Error('unexpected PING reply: ' + pong);
-    await client.set('healthcheck', 'ok', { EX: 10 });
+    await client.set('healthcheck', 'ok', 'EX', 10);
     const v = await client.get('healthcheck');
     console.log('✅ Redis preflight OK (PING & SET/GET):', v);
   } finally {
