@@ -1,17 +1,17 @@
 // worker-hls-and-mp4.js
 // Streaming + timeouts + retries + multi-rendition HLS + MP4, uploads to DigitalOcean Spaces via SigV2
 // Now with AVIF thumbnails at t=0s and t=10s ( -thumb-0.avif / -thumb-10.avif )
-// NOTE: No dotenv import. Start Node with:  --env-file=/root/worker/.env
+// Loads .env automatically and performs a Redis preflight check before starting workers.
 
 import 'dotenv/config';
-import crypto from "crypto";
-import { spawn } from "node:child_process";
-import fs from "node:fs/promises";
-import { createReadStream, createWriteStream } from "node:fs";
-import { pipeline } from "node:stream/promises";
-import path from "node:path";
-import fetch from "node-fetch";
-import Redis from "ioredis";
+import crypto from 'crypto';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import path from 'node:path';
+import fetch from 'node-fetch';
+import Redis from 'ioredis';
 
 /* =====================
    ENV & DEFAULTS
@@ -20,34 +20,36 @@ const {
   REDIS_URL,
   DO_ACCESS_KEY,
   DO_SECRET_KEY,
-  SPACES_REGION = "ams3",
-  SPACES_BUCKET = "700days",
-  OUT_FOLDER = "uploads-shd",
+  SPACES_REGION = 'ams3',
+  SPACES_BUCKET = '700days',
+  OUT_FOLDER = 'uploads-shd',
 
-  CONCURRENCY = "1",
-  FETCH_TIMEOUT_MS = "60000",
-  MAX_FETCH_RETRIES = "3",
-  BACKOFF_BASE_MS = "500",
+  CONCURRENCY = '1',
+  FETCH_TIMEOUT_MS = '60000',
+  MAX_FETCH_RETRIES = '3',
+  BACKOFF_BASE_MS = '500',
 
   // Output toggles
-  OUTPUT_MP4 = "true",
-  OUTPUT_HLS = "true",
+  OUTPUT_MP4 = 'true',
+  OUTPUT_HLS = 'true',
   // Comma-separated labels from the rendition map below
-  HLS_RENDITIONS = "1080p,720p,480p",
-  HLS_SEGMENT_SECONDS = "4",
+  HLS_RENDITIONS = '1080p,720p,480p',
+  HLS_SEGMENT_SECONDS = '4',
 
   // Public CDN base for finished URLs
-  CDN_BASE = "https://700days.ams3.cdn.digitaloceanspaces.com",
+  CDN_BASE = 'https://700days.ams3.cdn.digitaloceanspaces.com',
 
   // Thumbnails
-  THUMBS_ENABLE = "true",
-  THUMB_WIDTH = "1280" // will scale down keeping AR
+  THUMBS_ENABLE = 'true',
+  THUMB_WIDTH = '1280' // will scale down keeping AR
 } = process.env;
 
-const REQUIRED_ENV = ["REDIS_URL", "DO_ACCESS_KEY", "DO_SECRET_KEY"];
+const REQUIRED_ENV = ['REDIS_URL', 'DO_ACCESS_KEY', 'DO_SECRET_KEY'];
 function validateEnv() {
-  const missing = REQUIRED_ENV.filter((k) => !process.env[k] || String(process.env[k]).trim() === "");
-  console.log("[worker] boot", {
+  const missing = REQUIRED_ENV.filter(
+    (k) => !process.env[k] || String(process.env[k]).trim() === ''
+  );
+  console.log('[worker] boot', {
     cwd: process.cwd(),
     node: process.version,
     env: {
@@ -56,26 +58,26 @@ function validateEnv() {
       DO_SECRET_KEY: !!DO_SECRET_KEY,
       SPACES_REGION,
       SPACES_BUCKET,
-      OUT_FOLDER,
+      OUT_FOLDER
     }
   });
   if (missing.length) {
-    console.error("[worker] Missing required environment variables:", missing.join(", "));
+    console.error('[worker] Missing required environment variables:', missing.join(', '));
     process.exit(1);
   }
 }
 validateEnv();
 
 const endpoint = `${SPACES_BUCKET}.${SPACES_REGION}.digitaloceanspaces.com`;
-const CDN_BASE_URL = (CDN_BASE || "").replace(/\/$/, ""); // trim trailing slash
+const CDN_BASE_URL = (CDN_BASE || '').replace(/\/$/, ''); // trim trailing slash
 
 /* =====================
    Safety: normalize object keys
    ===================== */
 function normalizeKey(key) {
   // force forward slashes, remove leading slash, prevent path traversal
-  const s = String(key).replace(/\\/g, "/").replace(/^\/+/, "");
-  if (s.includes("..")) throw new Error("invalid key");
+  const s = String(key).replace(/\\/g, '/').replace(/^\/+/, '');
+  if (s.includes('..')) throw new Error('invalid key');
   return s;
 }
 
@@ -85,17 +87,21 @@ function normalizeKey(key) {
 function presignGet(key, ttl = 1800) {
   const k = normalizeKey(key);
   const expires = Math.floor(Date.now() / 1000) + ttl;
-  const stringToSign = ["GET", "", "", String(expires), `/${SPACES_BUCKET}/${k}`].join("\n");
-  const signature = crypto.createHmac("sha1", DO_SECRET_KEY).update(stringToSign).digest("base64");
-  return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(signature)}`;
+  const stringToSign = ['GET', '', '', String(expires), `/${SPACES_BUCKET}/${k}`].join('\n');
+  const signature = crypto.createHmac('sha1', DO_SECRET_KEY).update(stringToSign).digest('base64');
+  return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(
+    signature
+  )}`;
 }
 
 function presignPut(key, contentType, ttl = 1800) {
   const k = normalizeKey(key);
   const expires = Math.floor(Date.now() / 1000) + ttl;
-  const stringToSign = ["PUT", "", contentType, String(expires), `/${SPACES_BUCKET}/${k}`].join("\n");
-  const signature = crypto.createHmac("sha1", DO_SECRET_KEY).update(stringToSign).digest("base64");
-  return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(signature)}`;
+  const stringToSign = ['PUT', '', contentType, String(expires), `/${SPACES_BUCKET}/${k}`].join('\n');
+  const signature = crypto.createHmac('sha1', DO_SECRET_KEY).update(stringToSign).digest('base64');
+  return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(
+    signature
+  )}`;
 }
 
 /* =====================
@@ -148,43 +154,70 @@ function scaleFilter(width) {
 
 function mp4Args(inPath, outPath, r) {
   return [
-    "-y",
-    "-i", inPath,
-    "-vf", scaleFilter(r.width),
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", String(r.crf),
-    "-maxrate", String(r.maxrate),
-    "-bufsize", String(r.bufsize),
-    "-profile:v", "high",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-b:a", String(r.ab),
-    "-movflags", "+faststart",
+    '-y',
+    '-i',
+    inPath,
+    '-vf',
+    scaleFilter(r.width),
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-crf',
+    String(r.crf),
+    '-maxrate',
+    String(r.maxrate),
+    '-bufsize',
+    String(r.bufsize),
+    '-profile:v',
+    'high',
+    '-pix_fmt',
+    'yuv420p',
+    '-c:a',
+    'aac',
+    '-b:a',
+    String(r.ab),
+    '-movflags',
+    '+faststart',
     outPath
   ];
 }
 
 function hlsArgs(inPath, outDir, label, r) {
-  const playlist = path.join(outDir, label, "index.m3u8");
-  const segments = path.join(outDir, label, "segment_%03d.ts");
+  const playlist = path.join(outDir, label, 'index.m3u8');
+  const segments = path.join(outDir, label, 'segment_%03d.ts');
   return [
-    "-y",
-    "-i", inPath,
-    "-vf", scaleFilter(r.width),
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", String(r.crf),
-    "-maxrate", String(r.maxrate),
-    "-bufsize", String(r.bufsize),
-    "-profile:v", "high",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-b:a", String(r.ab),
-    "-start_number", "0",
-    "-hls_time", String(Number(HLS_SEGMENT_SECONDS)),
-    "-hls_playlist_type", "vod",
-    "-hls_segment_filename", segments,
+    '-y',
+    '-i',
+    inPath,
+    '-vf',
+    scaleFilter(r.width),
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-crf',
+    String(r.crf),
+    '-maxrate',
+    String(r.maxrate),
+    '-bufsize',
+    String(r.bufsize),
+    '-profile:v',
+    'high',
+    '-pix_fmt',
+    'yuv420p',
+    '-c:a',
+    'aac',
+    '-b:a',
+    String(r.ab),
+    '-start_number',
+    '0',
+    '-hls_time',
+    String(Number(HLS_SEGMENT_SECONDS)),
+    '-hls_playlist_type',
+    'vod',
+    '-hls_segment_filename',
+    segments,
     playlist
   ];
 }
@@ -196,14 +229,21 @@ function thumbArgs(inPath, outPath, ssSeconds) {
   // -ss before -i for faster seek; -frames:v 1 grabs a single frame
   // Using libaom-av1 still-picture mode for AVIF; adjust quality with -crf (0 best, 63 worst)
   return [
-    "-y",
-    "-ss", String(ssSeconds),
-    "-i", inPath,
-    "-frames:v", "1",
-    "-vf", `scale='min(${Number(THUMB_WIDTH)},iw)':-2:force_original_aspect_ratio=decrease`,
-    "-c:v", "libaom-av1",
-    "-still-picture", "1",
-    "-crf", "32",
+    '-y',
+    '-ss',
+    String(ssSeconds),
+    '-i',
+    inPath,
+    '-frames:v',
+    '1',
+    '-vf',
+    `scale='min(${Number(THUMB_WIDTH)},iw)':-2:force_original_aspect_ratio=decrease`,
+    '-c:v',
+    'libaom-av1',
+    '-still-picture',
+    '1',
+    '-crf',
+    '32',
     outPath
   ];
 }
@@ -211,8 +251,8 @@ function thumbArgs(inPath, outPath, ssSeconds) {
 async function generateThumb(inPath, outPath, whenSec) {
   await fs.mkdir(path.dirname(outPath), { recursive: true });
   await new Promise((resolve, reject) => {
-    const p = spawn("ffmpeg", thumbArgs(inPath, outPath, whenSec), { stdio: "inherit" });
-    p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg thumb ${whenSec}s exit ${code}`))));
+    const p = spawn('ffmpeg', thumbArgs(inPath, outPath, whenSec), { stdio: 'inherit' });
+    p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg thumb ${whenSec}s exit ${code}`))));
   });
 }
 
@@ -221,16 +261,13 @@ async function generateThumb(inPath, outPath, whenSec) {
    ===================== */
 async function writeMasterPlaylist(masterPath, variants) {
   // variants: [{ label, bandwidth, resolution, uri }]
-  const lines = [
-    "#EXTM3U",
-    "#EXT-X-VERSION:3",
-  ];
+  const lines = ['#EXTM3U', '#EXT-X-VERSION:3'];
   for (const v of variants) {
     lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},RESOLUTION=${v.resolution}`);
     lines.push(v.uri);
   }
   await fs.mkdir(path.dirname(masterPath), { recursive: true });
-  await fs.writeFile(masterPath, lines.join("\n"));
+  await fs.writeFile(masterPath, lines.join('\n'));
 }
 
 /* =====================
@@ -238,14 +275,14 @@ async function writeMasterPlaylist(masterPath, variants) {
    ===================== */
 function guessContentType(p) {
   const ext = path.extname(p).toLowerCase();
-  if (ext === ".mp4") return "video/mp4";
-  if (ext === ".m3u8") return "application/vnd.apple.mpegurl";
-  if (ext === ".ts") return "video/MP2T";
-  if (ext === ".m4s") return "video/mp4"; // CMAF segments
-  if (ext === ".avif") return "image/avif";
-  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
-  if (ext === ".png") return "image/png";
-  return "application/octet-stream";
+  if (ext === '.mp4') return 'video/mp4';
+  if (ext === '.m3u8') return 'application/vnd.apple.mpegurl';
+  if (ext === '.ts') return 'video/MP2T';
+  if (ext === '.m4s') return 'video/mp4'; // CMAF segments
+  if (ext === '.avif') return 'image/avif';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.png') return 'image/png';
+  return 'application/octet-stream';
 }
 
 async function uploadFile(localPath, outKey) {
@@ -255,9 +292,9 @@ async function uploadFile(localPath, outKey) {
   const res = await fetchWithTimeout(
     url,
     {
-      method: "PUT",
-      headers: { "Content-Type": ct, "Content-Length": String(stat.size) },
-      body: createReadStream(localPath),
+      method: 'PUT',
+      headers: { 'Content-Type': ct, 'Content-Length': String(stat.size) },
+      body: createReadStream(localPath)
     },
     { onAttempt: (a) => console.log(`[upload] ${outKey} attempt ${a + 1}`) }
   );
@@ -273,7 +310,7 @@ async function uploadDirectory(localDir, prefixKey) {
       if (e.isDirectory()) {
         await walk(full);
       } else {
-        const rel = path.relative(localDir, full).split(path.sep).join("/");
+        const rel = path.relative(localDir, full).split(path.sep).join('/');
         const key = `${prefixKey}/${rel}`;
         await uploadFile(full, key);
       }
@@ -286,7 +323,9 @@ async function uploadDirectory(localDir, prefixKey) {
    Download helper (streamed)
    ===================== */
 async function streamedDownload(inUrl, destPath, jobId) {
-  const res = await fetchWithTimeout(inUrl, {}, { onAttempt: (a) => console.log(`[job ${jobId}] download attempt ${a + 1}`) });
+  const res = await fetchWithTimeout(inUrl, {}, {
+    onAttempt: (a) => console.log(`[job ${jobId}] download attempt ${a + 1}`)
+  });
   if (!res.ok || !res.body) throw new Error(`download failed: ${res.status}`);
   await fs.mkdir(path.dirname(destPath), { recursive: true });
   await pipeline(res.body, createWriteStream(destPath));
@@ -299,7 +338,7 @@ async function processJob(redis, job, raw) {
   if (!job || !job.id || !job.key) return;
 
   const jobKey = `transcode:job:${job.id}`;
-  await redis.hset(jobKey, { status: "processing", startedAt: new Date().toISOString() });
+  await redis.hset(jobKey, { status: 'processing', startedAt: new Date().toISOString() });
 
   const inKey = normalizeKey(job.key);
   const outBase = inKey.replace(/^uploads\//, `${OUT_FOLDER}/`); // e.g. uploads/foo.mp4 -> uploads-shd/foo.mp4
@@ -307,18 +346,18 @@ async function processJob(redis, job, raw) {
   const inUrl = presignGet(inKey);
 
   const tmpDir = `/tmp/job-${job.id}`;
-  const inPath = path.join(tmpDir, "input.mp4");
-  const mp4OutPath = path.join(tmpDir, "output.mp4");
-  const hlsDir = path.join(tmpDir, "hls");
+  const inPath = path.join(tmpDir, 'input.mp4');
+  const mp4OutPath = path.join(tmpDir, 'output.mp4');
+  const hlsDir = path.join(tmpDir, 'hls');
 
   // Thumbs temp files
-  const thumb0Path = path.join(tmpDir, "thumb-0.avif");
-  const thumb10Path = path.join(tmpDir, "thumb-10.avif");
+  const thumb0Path = path.join(tmpDir, 'thumb-0.avif');
+  const thumb10Path = path.join(tmpDir, 'thumb-10.avif');
 
   // Choose rendition for MP4 (highest from configured list)
-  const labels = HLS_RENDITIONS.split(",").map((s) => s.trim()).filter(Boolean);
+  const labels = HLS_RENDITIONS.split(',').map((s) => s.trim()).filter(Boolean);
   const firstValid = labels.find((l) => RENDITIONS[l]);
-  const mp4Rendition = RENDITIONS[firstValid || "720p"]; // fallback 720p
+  const mp4Rendition = RENDITIONS[firstValid || '720p']; // fallback 720p
 
   try {
     // 1) Download source
@@ -327,10 +366,10 @@ async function processJob(redis, job, raw) {
     // 1b) Thumbnails (optional)
     let thumbKey0 = null,
       thumbKey10 = null;
-    if (THUMBS_ENABLE === "true") {
+    if (THUMBS_ENABLE === 'true') {
       await generateThumb(inPath, thumb0Path, 0);
       await generateThumb(inPath, thumb10Path, 10);
-      const baseNoExt = outBase.replace(/\.mp4$/i, "");
+      const baseNoExt = outBase.replace(/\.mp4$/i, '');
       thumbKey0 = `${baseNoExt}-thumb-0.avif`;
       thumbKey10 = `${baseNoExt}-thumb-10.avif`;
       await uploadFile(thumb0Path, thumbKey0);
@@ -339,20 +378,20 @@ async function processJob(redis, job, raw) {
 
     // 2) MP4 output (optional)
     let outputKeyMp4 = null;
-    if (OUTPUT_MP4 === "true") {
+    if (OUTPUT_MP4 === 'true') {
       await new Promise((resolve, reject) => {
         const args = mp4Args(inPath, mp4OutPath, mp4Rendition);
-        console.log(`[job ${job.id}] ffmpeg mp4:`, args.join(" "));
-        const p = spawn("ffmpeg", args, { stdio: "inherit" });
-        p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg mp4 exit ${code}`))));
+        console.log(`[job ${job.id}] ffmpeg mp4:`, args.join(' '));
+        const p = spawn('ffmpeg', args, { stdio: 'inherit' });
+        p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg mp4 exit ${code}`))));
       });
-      outputKeyMp4 = outBase.replace(/\.mp4$/i, "") + ".mp4";
+      outputKeyMp4 = outBase.replace(/\.mp4$/i, '') + '.mp4';
       await uploadFile(mp4OutPath, outputKeyMp4);
     }
 
     // 3) HLS outputs (optional): run one ffmpeg per rendition, then write master
     let outputKeyHlsMaster = null;
-    if (OUTPUT_HLS === "true") {
+    if (OUTPUT_HLS === 'true') {
       await fs.mkdir(hlsDir, { recursive: true });
       const hlsVariants = [];
       for (const label of labels) {
@@ -361,49 +400,49 @@ async function processJob(redis, job, raw) {
         const outSub = path.join(hlsDir, label);
         await fs.mkdir(outSub, { recursive: true });
         const args = hlsArgs(inPath, hlsDir, label, r);
-        console.log(`[job ${job.id}] ffmpeg hls ${label}:`, args.join(" "));
+        console.log(`[job ${job.id}] ffmpeg hls ${label}:`, args.join(' '));
         await new Promise((resolve, reject) => {
-          const p = spawn("ffmpeg", args, { stdio: "inherit" });
-          p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg hls ${label} exit ${code}`))));
+          const p = spawn('ffmpeg', args, { stdio: 'inherit' });
+          p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg hls ${label} exit ${code}`))));
         });
         // Collect variant info for master playlist
         hlsVariants.push({
           label,
           bandwidth: r.maxrate, // approximation for BANDWIDTH
           resolution: `${r.width}x${r.height}`,
-          uri: `${label}/index.m3u8`,
+          uri: `${label}/index.m3u8`
         });
       }
       // Write master.m3u8 at hls root
-      const masterPath = path.join(hlsDir, "master.m3u8");
+      const masterPath = path.join(hlsDir, 'master.m3u8');
       await writeMasterPlaylist(masterPath, hlsVariants);
 
       // Upload HLS tree under base without .mp4
-      const baseNoExt = outBase.replace(/\.mp4$/i, "");
+      const baseNoExt = outBase.replace(/\.mp4$/i, '');
       await uploadDirectory(hlsDir, baseNoExt);
       outputKeyHlsMaster = `${baseNoExt}/master.m3u8`;
     }
 
     // 4) Done: include public CDN URLs and thumbs
     await redis.hset(jobKey, {
-      status: "done",
+      status: 'done',
       finishedAt: new Date().toISOString(),
-      outputKeyMp4: outputKeyMp4 || "",
-      outputKeyHls: outputKeyHlsMaster || "",
-      publicUrlMp4: outputKeyMp4 ? `${CDN_BASE_URL}/${outputKeyMp4}` : "",
-      publicUrlHls: outputKeyHlsMaster ? `${CDN_BASE_URL}/${outputKeyHlsMaster}` : "",
-      thumbKey0: thumbKey0 || "",
-      thumbKey10: thumbKey10 || "",
-      publicThumbUrl0: thumbKey0 ? `${CDN_BASE_URL}/${thumbKey0}` : "",
-      publicThumbUrl10: thumbKey10 ? `${CDN_BASE_URL}/${thumbKey10}` : "",
+      outputKeyMp4: outputKeyMp4 || '',
+      outputKeyHls: outputKeyHlsMaster || '',
+      publicUrlMp4: outputKeyMp4 ? `${CDN_BASE_URL}/${outputKeyMp4}` : '',
+      publicUrlHls: outputKeyHlsMaster ? `${CDN_BASE_URL}/${outputKeyHlsMaster}` : '',
+      thumbKey0: thumbKey0 || '',
+      thumbKey10: thumbKey10 || '',
+      publicThumbUrl0: thumbKey0 ? `${CDN_BASE_URL}/${thumbKey0}` : '',
+      publicThumbUrl10: thumbKey10 ? `${CDN_BASE_URL}/${thumbKey10}` : ''
     });
   } catch (err) {
     console.error(`[job ${job.id}] error:`, err);
-    const attempts = Number((await redis.hincrby(jobKey, "attempts", 1)) || 0);
-    await redis.hset(jobKey, { status: "error", error: String(err) });
+    const attempts = Number((await redis.hincrby(jobKey, 'attempts', 1)) || 0);
+    await redis.hset(jobKey, { status: 'error', error: String(err) });
     if (attempts < 3) {
       await sleep(backoffDelay(attempts));
-      await redis.lpush("transcode:queue", raw);
+      await redis.lpush('transcode:queue', raw);
     }
   } finally {
     // cleanup temp dir
@@ -417,10 +456,27 @@ async function processJob(redis, job, raw) {
    RENDITION MAP
    ===================== */
 const RENDITIONS = {
-  "1080p": { width: 1920, height: 1080, crf: 22, maxrate: 6000000, bufsize: 12000000, ab: 128000 },
-  "720p":  { width: 1280, height: 720,  crf: 23, maxrate: 3500000, bufsize: 7000000,  ab: 128000 },
-  "480p":  { width: 854,  height: 480,  crf: 24, maxrate: 1800000, bufsize: 3600000,  ab: 96000  }
+  '1080p': { width: 1920, height: 1080, crf: 22, maxrate: 6000000, bufsize: 12000000, ab: 128000 },
+  '720p': { width: 1280, height: 720, crf: 23, maxrate: 3500000, bufsize: 7000000, ab: 128000 },
+  '480p': { width: 854, height: 480, crf: 24, maxrate: 1800000, bufsize: 3600000, ab: 96000 }
 };
+
+/* =====================
+   Redis preflight (ping + set/get)
+   ===================== */
+async function preflightRedis() {
+  const useTls = REDIS_URL.startsWith('rediss://');
+  const client = new Redis(REDIS_URL, useTls ? { tls: {}, maxRetriesPerRequest: 1 } : { maxRetriesPerRequest: 1 });
+  try {
+    const pong = await client.ping();
+    if (pong !== 'PONG') throw new Error('unexpected PING reply: ' + pong);
+    await client.set('healthcheck', 'ok', { EX: 10 });
+    const v = await client.get('healthcheck');
+    console.log('✅ Redis preflight OK (PING & SET/GET):', v);
+  } finally {
+    client.disconnect();
+  }
+}
 
 /* =====================
    Worker loop with concurrency
@@ -429,7 +485,7 @@ async function startWorker(id, redis) {
   console.log(`[worker ${id}] started`);
   while (true) {
     try {
-      const res = await redis.brpop("transcode:queue", 10);
+      const res = await redis.brpop('transcode:queue', 10);
       if (!res) continue;
       const [, raw] = res;
       let job;
@@ -449,24 +505,27 @@ async function startWorker(id, redis) {
 /* =====================
    Main
    ===================== */
-process.on("unhandledRejection", (err) => {
-  console.error("Unhandled rejection:", err);
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
   process.exit(1);
 });
 
 async function main() {
-  const useTls = REDIS_URL.startsWith("rediss://");
+  // Fail fast if preflight cannot reach Redis with credentials/TLS
+  await preflightRedis();
+
+  const useTls = REDIS_URL.startsWith('rediss://');
   const redis = new Redis(REDIS_URL, useTls ? { tls: {} } : undefined);
 
   const shutdown = async () => {
-    console.log("Shutting down...");
+    console.log('Shutting down...');
     try {
       await redis.quit();
     } catch {}
     process.exit(0);
   };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 
   const n = Math.max(1, Number(CONCURRENCY));
   await Promise.all(Array.from({ length: n }, (_, i) => startWorker(i + 1, redis)));
