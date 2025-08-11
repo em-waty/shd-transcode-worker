@@ -1,9 +1,8 @@
 // worker-hls-and-mp4.js
 // Streaming + timeouts + retries + multi-rendition HLS + MP4, uploads to DigitalOcean Spaces via SigV2
 // Now with AVIF thumbnails at t=0s and t=10s ( -thumb-0.avif / -thumb-10.avif )
-// Loads .env automatically and performs a Redis preflight check before starting workers.
+// This version requires Node to be started with: --env-file=/root/worker/.env
 
-import 'dotenv/config';
 import crypto from 'crypto';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
@@ -32,16 +31,13 @@ const {
   // Output toggles
   OUTPUT_MP4 = 'true',
   OUTPUT_HLS = 'true',
-  // Comma-separated labels from the rendition map below
   HLS_RENDITIONS = '1080p,720p,480p',
   HLS_SEGMENT_SECONDS = '4',
 
-  // Public CDN base for finished URLs
   CDN_BASE = 'https://700days.ams3.cdn.digitaloceanspaces.com',
 
-  // Thumbnails
   THUMBS_ENABLE = 'true',
-  THUMB_WIDTH = '1280' // will scale down keeping AR
+  THUMB_WIDTH = '1280'
 } = process.env;
 
 const REQUIRED_ENV = ['REDIS_URL', 'DO_ACCESS_KEY', 'DO_SECRET_KEY'];
@@ -69,8 +65,7 @@ function validateEnv() {
 validateEnv();
 
 const endpoint = `${SPACES_BUCKET}.${SPACES_REGION}.digitaloceanspaces.com`;
-const CDN_BASE_URL = (CDN_BASE || '').replace(/\/$/, ''); // trim trailing slash
-
+const CDN_BASE_URL = (CDN_BASE || '').replace(/\/$/, '');
 /* =====================
    Safety: normalize object keys
    ===================== */
@@ -89,9 +84,7 @@ function presignGet(key, ttl = 1800) {
   const expires = Math.floor(Date.now() / 1000) + ttl;
   const stringToSign = ['GET', '', '', String(expires), `/${SPACES_BUCKET}/${k}`].join('\n');
   const signature = crypto.createHmac('sha1', DO_SECRET_KEY).update(stringToSign).digest('base64');
-  return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(
-    signature
-  )}`;
+  return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(signature)}`;
 }
 
 function presignPut(key, contentType, ttl = 1800) {
@@ -99,9 +92,7 @@ function presignPut(key, contentType, ttl = 1800) {
   const expires = Math.floor(Date.now() / 1000) + ttl;
   const stringToSign = ['PUT', '', contentType, String(expires), `/${SPACES_BUCKET}/${k}`].join('\n');
   const signature = crypto.createHmac('sha1', DO_SECRET_KEY).update(stringToSign).digest('base64');
-  return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(
-    signature
-  )}`;
+  return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(signature)}`;
 }
 
 /* =====================
@@ -143,7 +134,6 @@ async function fetchWithTimeout(
   }
   throw lastErr;
 }
-
 /* =====================
    FFmpeg arg builders
    ===================== */
@@ -155,30 +145,18 @@ function scaleFilter(width) {
 function mp4Args(inPath, outPath, r) {
   return [
     '-y',
-    '-i',
-    inPath,
-    '-vf',
-    scaleFilter(r.width),
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-crf',
-    String(r.crf),
-    '-maxrate',
-    String(r.maxrate),
-    '-bufsize',
-    String(r.bufsize),
-    '-profile:v',
-    'high',
-    '-pix_fmt',
-    'yuv420p',
-    '-c:a',
-    'aac',
-    '-b:a',
-    String(r.ab),
-    '-movflags',
-    '+faststart',
+    '-i', inPath,
+    '-vf', scaleFilter(r.width),
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', String(r.crf),
+    '-maxrate', String(r.maxrate),
+    '-bufsize', String(r.bufsize),
+    '-profile:v', 'high',
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac',
+    '-b:a', String(r.ab),
+    '-movflags', '+faststart',
     outPath
   ];
 }
@@ -188,36 +166,21 @@ function hlsArgs(inPath, outDir, label, r) {
   const segments = path.join(outDir, label, 'segment_%03d.ts');
   return [
     '-y',
-    '-i',
-    inPath,
-    '-vf',
-    scaleFilter(r.width),
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-crf',
-    String(r.crf),
-    '-maxrate',
-    String(r.maxrate),
-    '-bufsize',
-    String(r.bufsize),
-    '-profile:v',
-    'high',
-    '-pix_fmt',
-    'yuv420p',
-    '-c:a',
-    'aac',
-    '-b:a',
-    String(r.ab),
-    '-start_number',
-    '0',
-    '-hls_time',
-    String(Number(HLS_SEGMENT_SECONDS)),
-    '-hls_playlist_type',
-    'vod',
-    '-hls_segment_filename',
-    segments,
+    '-i', inPath,
+    '-vf', scaleFilter(r.width),
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', String(r.crf),
+    '-maxrate', String(r.maxrate),
+    '-bufsize', String(r.bufsize),
+    '-profile:v', 'high',
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac',
+    '-b:a', String(r.ab),
+    '-start_number', '0',
+    '-hls_time', String(Number(HLS_SEGMENT_SECONDS)),
+    '-hls_playlist_type', 'vod',
+    '-hls_segment_filename', segments,
     playlist
   ];
 }
@@ -230,20 +193,13 @@ function thumbArgs(inPath, outPath, ssSeconds) {
   // Using libaom-av1 still-picture mode for AVIF; adjust quality with -crf (0 best, 63 worst)
   return [
     '-y',
-    '-ss',
-    String(ssSeconds),
-    '-i',
-    inPath,
-    '-frames:v',
-    '1',
-    '-vf',
-    `scale='min(${Number(THUMB_WIDTH)},iw)':-2:force_original_aspect_ratio=decrease`,
-    '-c:v',
-    'libaom-av1',
-    '-still-picture',
-    '1',
-    '-crf',
-    '32',
+    '-ss', String(ssSeconds),
+    '-i', inPath,
+    '-frames:v', '1',
+    '-vf', `scale='min(${Number(THUMB_WIDTH)},iw)':-2:force_original_aspect_ratio=decrease`,
+    '-c:v', 'libaom-av1',
+    '-still-picture', '1',
+    '-crf', '32',
     outPath
   ];
 }
@@ -269,7 +225,6 @@ async function writeMasterPlaylist(masterPath, variants) {
   await fs.mkdir(path.dirname(masterPath), { recursive: true });
   await fs.writeFile(masterPath, lines.join('\n'));
 }
-
 /* =====================
    Upload helpers
    ===================== */
@@ -330,7 +285,6 @@ async function streamedDownload(inUrl, destPath, jobId) {
   await fs.mkdir(path.dirname(destPath), { recursive: true });
   await pipeline(res.body, createWriteStream(destPath));
 }
-
 /* =====================
    Job processing
    ===================== */
@@ -364,8 +318,7 @@ async function processJob(redis, job, raw) {
     await streamedDownload(inUrl, inPath, job.id);
 
     // 1b) Thumbnails (optional)
-    let thumbKey0 = null,
-      thumbKey10 = null;
+    let thumbKey0 = null, thumbKey10 = null;
     if (THUMBS_ENABLE === 'true') {
       await generateThumb(inPath, thumb0Path, 0);
       await generateThumb(inPath, thumb10Path, 10);
@@ -410,7 +363,7 @@ async function processJob(redis, job, raw) {
           label,
           bandwidth: r.maxrate, // approximation for BANDWIDTH
           resolution: `${r.width}x${r.height}`,
-          uri: `${label}/index.m3u8`
+          uri: `${label}/index.m3u8`,
         });
       }
       // Write master.m3u8 at hls root
@@ -434,7 +387,7 @@ async function processJob(redis, job, raw) {
       thumbKey0: thumbKey0 || '',
       thumbKey10: thumbKey10 || '',
       publicThumbUrl0: thumbKey0 ? `${CDN_BASE_URL}/${thumbKey0}` : '',
-      publicThumbUrl10: thumbKey10 ? `${CDN_BASE_URL}/${thumbKey10}` : ''
+      publicThumbUrl10: thumbKey10 ? `${CDN_BASE_URL}/${thumbKey10}` : '',
     });
   } catch (err) {
     console.error(`[job ${job.id}] error:`, err);
@@ -451,14 +404,13 @@ async function processJob(redis, job, raw) {
     } catch {}
   }
 }
-
 /* =====================
    RENDITION MAP
    ===================== */
 const RENDITIONS = {
   '1080p': { width: 1920, height: 1080, crf: 22, maxrate: 6000000, bufsize: 12000000, ab: 128000 },
-  '720p': { width: 1280, height: 720, crf: 23, maxrate: 3500000, bufsize: 7000000, ab: 128000 },
-  '480p': { width: 854, height: 480, crf: 24, maxrate: 1800000, bufsize: 3600000, ab: 96000 }
+  '720p':  { width: 1280, height: 720,  crf: 23, maxrate: 3500000, bufsize: 7000000,  ab: 128000 },
+  '480p':  { width: 854,  height: 480,  crf: 24, maxrate: 1800000, bufsize: 3600000,  ab: 96000  }
 };
 
 /* =====================
@@ -519,9 +471,7 @@ async function main() {
 
   const shutdown = async () => {
     console.log('Shutting down...');
-    try {
-      await redis.quit();
-    } catch {}
+    try { await redis.quit(); } catch {}
     process.exit(0);
   };
   process.on('SIGTERM', shutdown);
