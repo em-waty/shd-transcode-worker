@@ -3,6 +3,7 @@
 // Now with AVIF thumbnails at t=0s and t=10s ( -thumb-0.avif / -thumb-10.avif )
 // NOTE: No dotenv import. Start Node with:  --env-file=/root/worker/.env
 
+import 'dotenv/config';
 import crypto from "crypto";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
