@@ -1,6 +1,7 @@
 // worker-hls-and-mp4.js
 // Streaming + timeouts + retries + multi-rendition HLS + MP4, uploads to DigitalOcean Spaces via SigV2
 // Now with AVIF thumbnails at t=0s and t=10s ( -thumb-0.avif / -thumb-10.avif )
+// NOTE: No dotenv import. Start Node with:  --env-file=/root/worker/.env
 
 import crypto from "crypto";
 import { spawn } from "node:child_process";
@@ -34,7 +35,7 @@ const {
   HLS_RENDITIONS = "1080p,720p,480p",
   HLS_SEGMENT_SECONDS = "4",
 
-  // NEW: public CDN base for finished URLs
+  // Public CDN base for finished URLs
   CDN_BASE = "https://700days.ams3.cdn.digitaloceanspaces.com",
 
   // Thumbnails
@@ -42,34 +43,58 @@ const {
   THUMB_WIDTH = "1280" // will scale down keeping AR
 } = process.env;
 
+const REQUIRED_ENV = ["REDIS_URL", "DO_ACCESS_KEY", "DO_SECRET_KEY"];
+function validateEnv() {
+  const missing = REQUIRED_ENV.filter((k) => !process.env[k] || String(process.env[k]).trim() === "");
+  console.log("[worker] boot", {
+    cwd: process.cwd(),
+    node: process.version,
+    env: {
+      REDIS_URL: !!REDIS_URL,
+      DO_ACCESS_KEY: !!DO_ACCESS_KEY,
+      DO_SECRET_KEY: !!DO_SECRET_KEY,
+      SPACES_REGION,
+      SPACES_BUCKET,
+      OUT_FOLDER,
+    }
+  });
+  if (missing.length) {
+    console.error("[worker] Missing required environment variables:", missing.join(", "));
+    process.exit(1);
+  }
+}
+validateEnv();
+
 const endpoint = `${SPACES_BUCKET}.${SPACES_REGION}.digitaloceanspaces.com`;
 const CDN_BASE_URL = (CDN_BASE || "").replace(/\/$/, ""); // trim trailing slash
 
 /* =====================
-   RENDITION MAP
-   Each entry defines: scale, crf, maxrate, bufsize, audio bitrate, resolution
+   Safety: normalize object keys
    ===================== */
-const RENDITIONS = {
-  "1080p": { width: 1920, height: 1080, crf: 22, maxrate: 6000000, bufsize: 12000000, ab: 128000 },
-  "720p":  { width: 1280, height: 720,  crf: 23, maxrate: 3500000, bufsize: 7000000,  ab: 128000 },
-  "480p":  { width: 854,  height: 480,  crf: 24, maxrate: 1800000, bufsize: 3600000,  ab: 96000  }
-};
+function normalizeKey(key) {
+  // force forward slashes, remove leading slash, prevent path traversal
+  const s = String(key).replace(/\\/g, "/").replace(/^\/+/, "");
+  if (s.includes("..")) throw new Error("invalid key");
+  return s;
+}
 
 /* =====================
-   UTIL: presign (SigV2 for Spaces)
+   UTIL: S3 SigV2 presign (Spaces)
    ===================== */
 function presignGet(key, ttl = 1800) {
+  const k = normalizeKey(key);
   const expires = Math.floor(Date.now() / 1000) + ttl;
-  const stringToSign = ["GET", "", "", String(expires), `/${SPACES_BUCKET}/${key}`].join("\n");
+  const stringToSign = ["GET", "", "", String(expires), `/${SPACES_BUCKET}/${k}`].join("\n");
   const signature = crypto.createHmac("sha1", DO_SECRET_KEY).update(stringToSign).digest("base64");
-  return `https://${endpoint}/${key}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(signature)}`;
+  return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(signature)}`;
 }
 
 function presignPut(key, contentType, ttl = 1800) {
+  const k = normalizeKey(key);
   const expires = Math.floor(Date.now() / 1000) + ttl;
-  const stringToSign = ["PUT", "", contentType, String(expires), `/${SPACES_BUCKET}/${key}`].join("\n");
+  const stringToSign = ["PUT", "", contentType, String(expires), `/${SPACES_BUCKET}/${k}`].join("\n");
   const signature = crypto.createHmac("sha1", DO_SECRET_KEY).update(stringToSign).digest("base64");
-  return `https://${endpoint}/${key}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(signature)}`;
+  return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(signature)}`;
 }
 
 /* =====================
@@ -79,15 +104,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function backoffDelay(attempt, base = Number(BACKOFF_BASE_MS)) {
   const expo = base * Math.pow(2, attempt);
-  return Math.floor(expo / 2 + Math.random() * expo / 2); // jitter
+  return Math.floor(expo / 2 + (Math.random() * expo) / 2); // jitter
 }
 
-async function fetchWithTimeout(url, opts = {}, {
-  timeoutMs = Number(FETCH_TIMEOUT_MS),
-  maxRetries = Number(MAX_FETCH_RETRIES),
-  retryOn = (res) => !res.ok,
-  onAttempt = () => {}
-} = {}) {
+async function fetchWithTimeout(
+  url,
+  opts = {},
+  {
+    timeoutMs = Number(FETCH_TIMEOUT_MS),
+    maxRetries = Number(MAX_FETCH_RETRIES),
+    // Retry on 5xx or network error; treat 4xx as fatal by default
+    retryOn = (res) => res.status >= 500,
+    onAttempt = () => {}
+  } = {}
+) {
   let lastErr;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     onAttempt(attempt);
@@ -221,13 +251,15 @@ async function uploadFile(localPath, outKey) {
   const stat = await fs.stat(localPath);
   const ct = guessContentType(localPath);
   const url = presignPut(outKey, ct);
-  const res = await fetchWithTimeout(url, {
-    method: "PUT",
-    headers: { "Content-Type": ct, "Content-Length": String(stat.size) },
-    body: createReadStream(localPath)
-  }, {
-    onAttempt: (a) => console.log(`[upload] ${outKey} attempt ${a+1}`)
-  });
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "PUT",
+      headers: { "Content-Type": ct, "Content-Length": String(stat.size) },
+      body: createReadStream(localPath),
+    },
+    { onAttempt: (a) => console.log(`[upload] ${outKey} attempt ${a + 1}`) }
+  );
   if (!res.ok) throw new Error(`upload failed ${res.status} for ${outKey}`);
 }
 
@@ -253,7 +285,7 @@ async function uploadDirectory(localDir, prefixKey) {
    Download helper (streamed)
    ===================== */
 async function streamedDownload(inUrl, destPath, jobId) {
-  const res = await fetchWithTimeout(inUrl, {}, { onAttempt: (a) => console.log(`[job ${jobId}] download attempt ${a+1}`) });
+  const res = await fetchWithTimeout(inUrl, {}, { onAttempt: (a) => console.log(`[job ${jobId}] download attempt ${a + 1}`) });
   if (!res.ok || !res.body) throw new Error(`download failed: ${res.status}`);
   await fs.mkdir(path.dirname(destPath), { recursive: true });
   await pipeline(res.body, createWriteStream(destPath));
@@ -268,7 +300,7 @@ async function processJob(redis, job, raw) {
   const jobKey = `transcode:job:${job.id}`;
   await redis.hset(jobKey, { status: "processing", startedAt: new Date().toISOString() });
 
-  const inKey = job.key;
+  const inKey = normalizeKey(job.key);
   const outBase = inKey.replace(/^uploads\//, `${OUT_FOLDER}/`); // e.g. uploads/foo.mp4 -> uploads-shd/foo.mp4
 
   const inUrl = presignGet(inKey);
@@ -283,8 +315,8 @@ async function processJob(redis, job, raw) {
   const thumb10Path = path.join(tmpDir, "thumb-10.avif");
 
   // Choose rendition for MP4 (highest from configured list)
-  const labels = HLS_RENDITIONS.split(",").map(s => s.trim()).filter(Boolean);
-  const firstValid = labels.find(l => RENDITIONS[l]);
+  const labels = HLS_RENDITIONS.split(",").map((s) => s.trim()).filter(Boolean);
+  const firstValid = labels.find((l) => RENDITIONS[l]);
   const mp4Rendition = RENDITIONS[firstValid || "720p"]; // fallback 720p
 
   try {
@@ -292,7 +324,8 @@ async function processJob(redis, job, raw) {
     await streamedDownload(inUrl, inPath, job.id);
 
     // 1b) Thumbnails (optional)
-    let thumbKey0 = null, thumbKey10 = null;
+    let thumbKey0 = null,
+      thumbKey10 = null;
     if (THUMBS_ENABLE === "true") {
       await generateThumb(inPath, thumb0Path, 0);
       await generateThumb(inPath, thumb10Path, 10);
@@ -337,7 +370,7 @@ async function processJob(redis, job, raw) {
           label,
           bandwidth: r.maxrate, // approximation for BANDWIDTH
           resolution: `${r.width}x${r.height}`,
-          uri: `${label}/index.m3u8`
+          uri: `${label}/index.m3u8`,
         });
       }
       // Write master.m3u8 at hls root
@@ -361,11 +394,11 @@ async function processJob(redis, job, raw) {
       thumbKey0: thumbKey0 || "",
       thumbKey10: thumbKey10 || "",
       publicThumbUrl0: thumbKey0 ? `${CDN_BASE_URL}/${thumbKey0}` : "",
-      publicThumbUrl10: thumbKey10 ? `${CDN_BASE_URL}/${thumbKey10}` : ""
+      publicThumbUrl10: thumbKey10 ? `${CDN_BASE_URL}/${thumbKey10}` : "",
     });
   } catch (err) {
     console.error(`[job ${job.id}] error:`, err);
-    const attempts = Number(await redis.hincrby(jobKey, "attempts", 1)) || 0;
+    const attempts = Number((await redis.hincrby(jobKey, "attempts", 1)) || 0);
     await redis.hset(jobKey, { status: "error", error: String(err) });
     if (attempts < 3) {
       await sleep(backoffDelay(attempts));
@@ -373,9 +406,20 @@ async function processJob(redis, job, raw) {
     }
   } finally {
     // cleanup temp dir
-    try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
+    try {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    } catch {}
   }
 }
+
+/* =====================
+   RENDITION MAP
+   ===================== */
+const RENDITIONS = {
+  "1080p": { width: 1920, height: 1080, crf: 22, maxrate: 6000000, bufsize: 12000000, ab: 128000 },
+  "720p":  { width: 1280, height: 720,  crf: 23, maxrate: 3500000, bufsize: 7000000,  ab: 128000 },
+  "480p":  { width: 854,  height: 480,  crf: 24, maxrate: 1800000, bufsize: 3600000,  ab: 96000  }
+};
 
 /* =====================
    Worker loop with concurrency
@@ -388,7 +432,11 @@ async function startWorker(id, redis) {
       if (!res) continue;
       const [, raw] = res;
       let job;
-      try { job = JSON.parse(raw); } catch { continue; }
+      try {
+        job = JSON.parse(raw);
+      } catch {
+        continue;
+      }
       await processJob(redis, job, raw);
     } catch (e) {
       console.error(`[worker ${id}] loop error:`, e);
@@ -400,17 +448,20 @@ async function startWorker(id, redis) {
 /* =====================
    Main
    ===================== */
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection:", err);
+  process.exit(1);
+});
+
 async function main() {
-  if (!REDIS_URL || !DO_ACCESS_KEY || !DO_SECRET_KEY) {
-    console.error("Missing required environment variables");
-    process.exit(1);
-  }
   const useTls = REDIS_URL.startsWith("rediss://");
   const redis = new Redis(REDIS_URL, useTls ? { tls: {} } : undefined);
 
   const shutdown = async () => {
     console.log("Shutting down...");
-    try { await redis.quit(); } catch {}
+    try {
+      await redis.quit();
+    } catch {}
     process.exit(0);
   };
   process.on("SIGTERM", shutdown);
