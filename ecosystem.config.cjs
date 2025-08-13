@@ -1,7 +1,7 @@
-// ecosystem.config.cjs
+// /root/worker/ecosystem.config.cjs
 module.exports = {
   apps: [
-    // 1) Your existing transcoder worker (unchanged)
+    // 1) Transcode worker
     {
       name: "shd-transcode-worker",
       script: "/root/worker/worker-hls-and-mp4.js",
@@ -9,32 +9,33 @@ module.exports = {
       exec_mode: "cluster",
       instances: 1,
       interpreter: "node",
-      node_args: ["--enable-source-maps", "--env-file=/root/worker/.env"],
+      node_args: ["--enable-source-maps"],
+      env_file: "/root/worker/.env",          // PM2 loads your .env automatically
       env: {
         NODE_ENV: "production",
-        NODE_OPTIONS: ""
-      }
+        NODE_OPTIONS: ""                       // ensure no global -r preloads
+      },
+      watch: false,
+      autorestart: true
     },
 
     // 2) New: HTTP enqueue gateway (small Express API)
+    // Purpose: accept POST /enqueue and push jobs into Redis without exposing Redis to clients.
+    // Keep this if you want to enqueue via HTTP from other services, CLIs, or your website.
     {
       name: "enqueue-api",
       script: "/root/worker/enqueue-api.js",
       cwd: "/root/worker",
-      // a lightweight API is fine in "fork" mode, but cluster 1 also works
       exec_mode: "fork",
       instances: 1,
       interpreter: "node",
-      node_args: ["--enable-source-maps", "--env-file=/root/worker/.env"],
+      node_args: ["--enable-source-maps"],
+      env_file: "/root/worker/.env",           // uses ENQUEUE_TOKEN, PORT, QUEUE_KEY, REDIS_URL
       env: {
-        NODE_ENV: "production",
-        // PORT, ENQUEUE_TOKEN, REDIS_URL, QUEUE_KEY come from /root/worker/.env
-        // Example .env:
-        //   PORT=4001
-        //   ENQUEUE_TOKEN=your-long-secret
-        //   REDIS_URL=rediss://user:pass@host:port
-        //   QUEUE_KEY=shd:transcode:jobs
-      }
+        NODE_ENV: "production"
+      },
+      watch: false,
+      autorestart: true
     }
   ]
 };
