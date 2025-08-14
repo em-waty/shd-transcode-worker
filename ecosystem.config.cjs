@@ -17,6 +17,7 @@ module.exports = {
       },
       watch: false,
       autorestart: true
+      max_memory_restart: "150M" // ⬅ restart if memory > 150 MB
     },
 
     // 2) New: HTTP enqueue gateway (small Express API)
