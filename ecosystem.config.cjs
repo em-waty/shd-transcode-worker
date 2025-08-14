@@ -16,7 +16,7 @@ module.exports = {
         NODE_OPTIONS: ""                       // ensure no global -r preloads
       },
       watch: false,
-      autorestart: true
+      autorestart: true,
       max_memory_restart: "150M" // ⬅ restart if memory > 150 MB
     },
 
