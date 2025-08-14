@@ -9,7 +9,7 @@ module.exports = {
       exec_mode: "cluster",
       instances: 1,
       interpreter: "node",
-      node_args: ["--enable-source-maps"],
+      node_args: ["--enable-source-maps", "--env-file=/root/worker/.env"],
       env_file: "/root/worker/.env",          // PM2 loads your .env automatically
       env: {
         NODE_ENV: "production",
