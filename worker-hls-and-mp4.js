@@ -37,7 +37,13 @@ const {
   CDN_BASE = 'https://700days.ams3.cdn.digitaloceanspaces.com',
 
   THUMBS_ENABLE = 'true',
-  THUMB_WIDTH = '1280'
+  THUMB_WIDTH = '1280',
+
+  // job status retention
+  JOB_TTL_SEC = String(3 * 24 * 3600), // 3 days
+
+  // NEW: make outputs under OUT_FOLDER public at upload time
+  PUBLIC_OUTPUTS = 'true'
 } = process.env;
 
 const REQUIRED_ENV = ['REDIS_URL', 'DO_ACCESS_KEY', 'DO_SECRET_KEY'];
@@ -54,7 +60,8 @@ function validateEnv() {
       DO_SECRET_KEY: !!DO_SECRET_KEY,
       SPACES_REGION,
       SPACES_BUCKET,
-      OUT_FOLDER
+      OUT_FOLDER,
+      PUBLIC_OUTPUTS
     }
   });
   if (missing.length) {
@@ -66,6 +73,20 @@ validateEnv();
 
 const endpoint = `${SPACES_BUCKET}.${SPACES_REGION}.digitaloceanspaces.com`;
 const CDN_BASE_URL = (CDN_BASE || '').replace(/\/$/, '');
+
+/* =====================
+   Status helpers (Redis)
+   ===================== */
+function statusKey(jobId) {
+  return `transcode:job:${jobId}`;
+}
+
+async function setStatus(redis, jobId, fields) {
+  const key = statusKey(jobId);
+  await redis.hset(key, fields);
+  await redis.expire(key, Number(JOB_TTL_SEC));
+}
+
 /* =====================
    Safety: normalize object keys
    ===================== */
@@ -87,12 +108,38 @@ function presignGet(key, ttl = 1800) {
   return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(signature)}`;
 }
 
-function presignPut(key, contentType, ttl = 1800) {
+/**
+ * SigV2 presign for PUT that correctly canonicalizes and signs x-amz-* headers.
+ * Any x-amz-* headers you intend to send MUST be included here, or the signature will not match.
+ */
+function presignPut(key, contentType, ttl = 1800, amzHeaders = {}) {
   const k = normalizeKey(key);
   const expires = Math.floor(Date.now() / 1000) + ttl;
-  const stringToSign = ['PUT', '', contentType, String(expires), `/${SPACES_BUCKET}/${k}`].join('\n');
+
+  // Canonicalize x-amz-* headers: lowercase keys, trim, collapse spaces, sort by header name
+  const canonAmz = Object.entries(amzHeaders)
+    .map(([hk, hv]) => [String(hk).toLowerCase().trim(), String(hv).trim().replace(/\s+/g, ' ')])
+    .filter(([hk]) => hk.startsWith('x-amz-'))
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([hk, hv]) => `${hk}:${hv}\n`)
+    .join('');
+
+  const stringToSign = [
+    'PUT',
+    '',                               // Content-MD5
+    contentType || '',                // Content-Type
+    String(expires),
+    `${canonAmz}/${SPACES_BUCKET}/${k}`
+  ].join('\n');
+
   const signature = crypto.createHmac('sha1', DO_SECRET_KEY).update(stringToSign).digest('base64');
-  return `https://${endpoint}/${k}?AWSAccessKeyId=${DO_ACCESS_KEY}&Expires=${expires}&Signature=${encodeURIComponent(signature)}`;
+
+  const url = new URL(`https://${endpoint}/${k}`);
+  url.searchParams.set('AWSAccessKeyId', DO_ACCESS_KEY);
+  url.searchParams.set('Expires', String(expires));
+  url.searchParams.set('Signature', encodeURIComponent(signature));
+
+  return { url: url.toString(), signedAmzHeaders: amzHeaders };
 }
 
 /* =====================
@@ -134,6 +181,7 @@ async function fetchWithTimeout(
   }
   throw lastErr;
 }
+
 /* =====================
    FFmpeg arg builders
    ===================== */
@@ -188,12 +236,12 @@ function hlsArgs(inPath, outDir, label, r) {
 /* =====================
    Thumbnails (AVIF)
    ===================== */
-function thumbArgs(inPath, outPath, ssSeconds) {
+function thumbArgs(inPath, outPath, whenSec) {
   // -ss before -i for faster seek; -frames:v 1 grabs a single frame
   // Using libaom-av1 still-picture mode for AVIF; adjust quality with -crf (0 best, 63 worst)
   return [
     '-y',
-    '-ss', String(ssSeconds),
+    '-ss', String(whenSec),
     '-i', inPath,
     '-frames:v', '1',
     '-vf', `scale='min(${Number(THUMB_WIDTH)},iw)':-2:force_original_aspect_ratio=decrease`,
@@ -225,6 +273,7 @@ async function writeMasterPlaylist(masterPath, variants) {
   await fs.mkdir(path.dirname(masterPath), { recursive: true });
   await fs.writeFile(masterPath, lines.join('\n'));
 }
+
 /* =====================
    Upload helpers
    ===================== */
@@ -243,14 +292,23 @@ function guessContentType(p) {
 async function uploadFile(localPath, outKey) {
   const stat = await fs.stat(localPath);
   const ct = guessContentType(localPath);
-  const url = presignPut(outKey, ct);
+
+  // Only make public if desired and under OUT_FOLDER prefix
+  const makePublic = (PUBLIC_OUTPUTS === 'true') && outKey.startsWith(`${OUT_FOLDER}/`);
+  const amz = makePublic ? { 'x-amz-acl': 'public-read' } : {};
+
+  // presign with the same x-amz-* headers you'll send
+  const { url, signedAmzHeaders } = presignPut(outKey, ct, 1800, amz);
+
+  const headers = {
+    'Content-Type': ct,
+    'Content-Length': String(stat.size),
+    ...signedAmzHeaders // includes x-amz-acl when enabled
+  };
+
   const res = await fetchWithTimeout(
     url,
-    {
-      method: 'PUT',
-      headers: { 'Content-Type': ct, 'Content-Length': String(stat.size) },
-      body: createReadStream(localPath)
-    },
+    { method: 'PUT', headers, body: createReadStream(localPath) },
     { onAttempt: (a) => console.log(`[upload] ${outKey} attempt ${a + 1}`) }
   );
   if (!res.ok) throw new Error(`upload failed ${res.status} for ${outKey}`);
@@ -285,18 +343,15 @@ async function streamedDownload(inUrl, destPath, jobId) {
   await fs.mkdir(path.dirname(destPath), { recursive: true });
   await pipeline(res.body, createWriteStream(destPath));
 }
+
 /* =====================
    Job processing
    ===================== */
 async function processJob(redis, job, raw) {
   if (!job || !job.id || !job.key) return;
 
-  const jobKey = `transcode:job:${job.id}`;
-  await redis.hset(jobKey, { status: 'processing', startedAt: new Date().toISOString() });
-
   const inKey = normalizeKey(job.key);
   const outBase = inKey.replace(/^uploads\//, `${OUT_FOLDER}/`); // e.g. uploads/foo.mp4 -> uploads-shd/foo.mp4
-
   const inUrl = presignGet(inKey);
 
   const tmpDir = `/tmp/job-${job.id}`;
@@ -314,6 +369,13 @@ async function processJob(redis, job, raw) {
   const mp4Rendition = RENDITIONS[firstValid || '720p']; // fallback 720p
 
   try {
+    // Mark processing
+    await setStatus(redis, job.id, {
+      status: 'processing',
+      startedAt: new Date().toISOString(),
+      key: job.key
+    });
+
     // 1) Download source
     await streamedDownload(inUrl, inPath, job.id);
 
@@ -362,7 +424,7 @@ async function processJob(redis, job, raw) {
         hlsVariants.push({
           label,
           bandwidth: r.maxrate, // approximation for BANDWIDTH
-          resolution: `${r.width}x${r.height}`,
+        resolution: `${r.width}x${r.height}`,
           uri: `${label}/index.m3u8`,
         });
       }
@@ -377,7 +439,7 @@ async function processJob(redis, job, raw) {
     }
 
     // 4) Done: include public CDN URLs and thumbs
-    await redis.hset(jobKey, {
+    await setStatus(redis, job.id, {
       status: 'done',
       finishedAt: new Date().toISOString(),
       outputKeyMp4: outputKeyMp4 || '',
@@ -387,12 +449,20 @@ async function processJob(redis, job, raw) {
       thumbKey0: thumbKey0 || '',
       thumbKey10: thumbKey10 || '',
       publicThumbUrl0: thumbKey0 ? `${CDN_BASE_URL}/${thumbKey0}` : '',
-      publicThumbUrl10: thumbKey10 ? `${CDN_BASE_URL}/${thumbKey10}` : '',
+      publicThumbUrl10: thumbKey10 ? `${CDN_BASE_URL}/${thumbKey10}` : ''
     });
+
   } catch (err) {
     console.error(`[job ${job.id}] error:`, err);
-    const attempts = Number((await redis.hincrby(jobKey, 'attempts', 1)) || 0);
-    await redis.hset(jobKey, { status: 'error', error: String(err) });
+    const key = statusKey(job.id);
+    const attempts = Number((await redis.hincrby(key, 'attempts', 1)) || 0);
+
+    await setStatus(redis, job.id, {
+      status: 'failed',
+      error: String(err),
+      failedAt: new Date().toISOString()
+    });
+
     if (attempts < 3) {
       await sleep(backoffDelay(attempts));
       await redis.lpush('transcode:queue', raw);
@@ -404,6 +474,7 @@ async function processJob(redis, job, raw) {
     } catch {}
   }
 }
+
 /* =====================
    RENDITION MAP
    ===================== */
@@ -446,6 +517,10 @@ async function startWorker(id, redis) {
       } catch {
         continue;
       }
+
+      // Ensure every job has an id
+      if (!job.id) job.id = crypto.randomUUID();
+
       await processJob(redis, job, raw);
     } catch (e) {
       console.error(`[worker ${id}] loop error:`, e);
